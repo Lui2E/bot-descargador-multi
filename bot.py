@@ -6,14 +6,17 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
-# --- CONFIGURACIÓN ---
-TOKEN = "8753908799:AAEiVXTEILZPDuv9u4qOcD5gzEKTqhDOqc4"
-ADSGRAM_BLOCK_ID = "bot-29830" 
-ADMIN_ID = 8111986339  # <--- REEMPLAZA ESTO CON TU ID REAL (el de @userinfobot)
+# --- CONFIGURACIÓN CON VARIABLES DE ENTORNO ---
+# os.getenv busca el nombre en los "Secrets" de Hugging Face
+TOKEN = os.getenv("TOKEN")
+ADSGRAM_BLOCK_ID = os.getenv("ADSGRAM_BLOCK_ID")
+# Convertimos el ID de Admin a entero porque los Secrets vienen como texto
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0)) 
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+# Carpeta temporal para descargas
 if not os.path.exists("downloads"):
     os.makedirs("downloads")
 
@@ -72,12 +75,12 @@ async def handle_link(message: types.Message):
     )
     
     try:
-        # Esto te envía la información a ti de forma silenciosa
-        await bot.send_message(chat_id=ADMIN_ID, text=log_text, parse_mode="Markdown", disable_web_page_preview=True)
+        if ADMIN_ID != 0:
+            await bot.send_message(chat_id=ADMIN_ID, text=log_text, parse_mode="Markdown", disable_web_page_preview=True)
     except Exception as e:
         print(f"Error enviando log al admin: {e}")
 
-    # 2. Lógica normal para el usuario
+    # 2. Lógica normal para el usuario con Publicidad real
     ad_link, ad_text = await get_ad_data(user_id)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=ad_text, url=ad_link)]])
     
@@ -86,6 +89,9 @@ async def handle_link(message: types.Message):
     try:
         file_path = await asyncio.to_thread(download_media, url, user_id)
         
+        if not os.path.exists(file_path):
+            raise Exception("Archivo no encontrado")
+
         if file_path.lower().endswith(('.mp4', '.mkv', '.mov', '.webm')):
             await message.reply_video(video=FSInputFile(file_path), caption="✅ **Video descargado con éxito.**")
         elif file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
@@ -98,11 +104,12 @@ async def handle_link(message: types.Message):
         await status_msg.delete()
 
     except Exception as e:
-        await message.reply(f"❌ Error al procesar.")
-        await status_msg.delete()
+        await message.reply(f"❌ Error al procesar el enlace.")
+        if status_msg:
+            await status_msg.delete()
 
 async def main():
-    print("🚀 Bot iniciado con monitoreo de admin...")
+    print("🚀 Bot iniciado con monitoreo de admin y variables de entorno...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
