@@ -5,29 +5,18 @@ import httpx
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
-from flask import Flask
-from threading import Thread
 
-# --- CONFIGURACIÓN DE FLASK (KEEP-ALIVE PARA RENDER) ---
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is alive!"
-
-def run_web():
-    # Render usa el puerto 10000 por defecto para Web Services
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-
-# --- CONFIGURACIÓN DEL BOT ---
+# --- CONFIGURACIÓN CON VARIABLES DE ENTORNO ---
+# os.getenv busca el nombre en los "Secrets" de Hugging Face
 TOKEN = os.getenv("TOKEN")
 ADSGRAM_BLOCK_ID = os.getenv("ADSGRAM_BLOCK_ID")
+# Convertimos el ID de Admin a entero porque los Secrets vienen como texto
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0)) 
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+# Carpeta temporal para descargas
 if not os.path.exists("downloads"):
     os.makedirs("downloads")
 
@@ -64,7 +53,7 @@ async def cmd_start(message: types.Message):
     await message.reply(
         "👋 **¡Bienvenido al Descargador Pro!**\n\n"
         "Puedo bajar contenido de:\n"
-        "✅ TikTok, Instagram, Facebook, X y LinkedIn.\n\n"
+        "✅ TikTok\n✅ Instagram\n✅ Facebook\n✅ X (Twitter)\n✅ LinkedIn\n\n"
         "Solo **envíame el enlace** de la publicación."
     )
 
@@ -76,18 +65,22 @@ async def handle_link(message: types.Message):
     username = f"@{user.username}" if user.username else "Sin username"
     full_name = user.full_name
 
-    if ADMIN_ID != 0:
-        log_text = (
-            "📊 **LOG DE ACTIVIDAD**\n\n"
-            f"👤 **Usuario:** {full_name}\n"
-            f"🆔 **ID:** `{user_id}`\n"
-            f"🔗 **Enlace:** {url}"
-        )
-        try:
+    # 1. NOTIFICACIÓN PARA EL ADMIN (TÚ)
+    log_text = (
+        "📊 **LOG DE ACTIVIDAD**\n\n"
+        f"👤 **Usuario:** {full_name}\n"
+        f"🆔 **ID:** `{user_id}`\n"
+        f"🏷 **Username:** {username}\n"
+        f"🔗 **Enlace enviado:** {url}"
+    )
+    
+    try:
+        if ADMIN_ID != 0:
             await bot.send_message(chat_id=ADMIN_ID, text=log_text, parse_mode="Markdown", disable_web_page_preview=True)
-        except Exception as e:
-            print(f"Error log admin: {e}")
+    except Exception as e:
+        print(f"Error enviando log al admin: {e}")
 
+    # 2. Lógica normal para el usuario con Publicidad real
     ad_link, ad_text = await get_ad_data(user_id)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=ad_text, url=ad_link)]])
     
@@ -99,13 +92,12 @@ async def handle_link(message: types.Message):
         if not os.path.exists(file_path):
             raise Exception("Archivo no encontrado")
 
-        file_input = FSInputFile(file_path)
         if file_path.lower().endswith(('.mp4', '.mkv', '.mov', '.webm')):
-            await message.reply_video(video=file_input, caption="✅ **Video descargado.**")
+            await message.reply_video(video=FSInputFile(file_path), caption="✅ **Video descargado con éxito.**")
         elif file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-            await message.reply_photo(photo=file_input, caption="✅ **Imagen descargada.**")
+            await message.reply_photo(photo=FSInputFile(file_path), caption="✅ **Imagen descargada con éxito.**")
         else:
-            await message.reply_document(document=file_input, caption="✅ **Archivo listo.**")
+            await message.reply_document(document=FSInputFile(file_path), caption="✅ **Archivo listo.**")
         
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -117,13 +109,8 @@ async def handle_link(message: types.Message):
             await status_msg.delete()
 
 async def main():
-    # Limpiamos webhooks para asegurar que el polling funcione bien en Render
-    await bot.delete_webhook(drop_pending_updates=True)
-    print("🚀 Bot iniciado en Render con Flask Keep-Alive...")
+    print("🚀 Bot iniciado con monitoreo de admin y variables de entorno...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    # 1. Lanzamos el servidor Flask en un hilo secundario
-    Thread(target=run_web).start()
-    # 2. Lanzamos el bot de Telegram en el bucle principal
     asyncio.run(main())
