@@ -5,18 +5,29 @@ import httpx
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from flask import Flask
+from threading import Thread
 
-# --- CONFIGURACIÓN CON VARIABLES DE ENTORNO ---
-# os.getenv busca el nombre en los "Secrets" de Hugging Face
+# --- CONFIGURACIÓN DE FLASK (KEEP-ALIVE) ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_web():
+    # Render asigna un puerto dinámico en la variable de entorno PORT
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# --- CONFIGURACIÓN DEL BOT ---
 TOKEN = os.getenv("TOKEN")
 ADSGRAM_BLOCK_ID = os.getenv("ADSGRAM_BLOCK_ID")
-# Convertimos el ID de Admin a entero porque los Secrets vienen como texto
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0)) 
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Carpeta temporal para descargas
 if not os.path.exists("downloads"):
     os.makedirs("downloads")
 
@@ -65,7 +76,6 @@ async def handle_link(message: types.Message):
     username = f"@{user.username}" if user.username else "Sin username"
     full_name = user.full_name
 
-    # 1. NOTIFICACIÓN PARA EL ADMIN (TÚ)
     log_text = (
         "📊 **LOG DE ACTIVIDAD**\n\n"
         f"👤 **Usuario:** {full_name}\n"
@@ -80,7 +90,6 @@ async def handle_link(message: types.Message):
     except Exception as e:
         print(f"Error enviando log al admin: {e}")
 
-    # 2. Lógica normal para el usuario con Publicidad real
     ad_link, ad_text = await get_ad_data(user_id)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=ad_text, url=ad_link)]])
     
@@ -109,8 +118,13 @@ async def handle_link(message: types.Message):
             await status_msg.delete()
 
 async def main():
-    print("🚀 Bot iniciado con monitoreo de admin y variables de entorno...")
+    # Es buena práctica limpiar webhooks antes de empezar polling
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("🚀 Bot iniciado con Flask (Keep-Alive) activo...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    # 1. Iniciamos el servidor web en un hilo aparte
+    Thread(target=run_web).start()
+    # 2. Iniciamos el bot de Telegram
     asyncio.run(main())
