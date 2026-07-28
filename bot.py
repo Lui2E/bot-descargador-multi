@@ -3,7 +3,7 @@ import asyncio
 import yt_dlp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import FSInputFile
 from flask import Flask
 from threading import Thread
 
@@ -20,7 +20,6 @@ def run_web():
 
 # --- CONFIGURACIÓN DEL BOT ---
 TOKEN = os.getenv("TOKEN")
-MONETAG_URL = os.getenv("MONETAG_URL", "https://omg10.com/4/11447024")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 bot = Bot(token=TOKEN)
@@ -76,12 +75,8 @@ async def handle_link(message: types.Message):
         except Exception as e:
             print(f"Error enviando log al admin: {e}")
 
-    # Botón con tu Smartlink de Monetag
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🎁 Patrocinado", url=MONETAG_URL)
-    ]])
-
-    status_msg = await message.reply("🔎 **Procesando...**", reply_markup=kb, parse_mode="Markdown")
+    # Mensaje de estado simple sin botones de anuncios
+    status_msg = await message.reply("🔎 **Procesando...**", parse_mode="Markdown")
     file_path = None
 
     try:
@@ -102,7 +97,7 @@ async def handle_link(message: types.Message):
         print(f"Error procesando {url}: {e}")
         await message.reply("❌ Error al procesar el enlace. Verifica que la publicación sea pública.")
     finally:
-        # Garantiza eliminar el archivo descargado y quitar el mensaje "Procesando..."
+        # Elimina el archivo local descargado y borra el mensaje "Procesando..."
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
@@ -117,7 +112,7 @@ async def handle_link(message: types.Message):
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🚀 Bot iniciado con servidor Keep-Alive...")
+    print("🚀 Bot iniciado correctamente...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
