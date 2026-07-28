@@ -73,7 +73,7 @@ async def handle_link(message: types.Message):
     url = message.text
     user = message.from_user
     user_id = user.id
-    username = f"@{user.username}" if user.username else "Sin username"
+    username = user.username if user.username else "Sin username"
     full_name = user.full_name
 
     log_text = (
