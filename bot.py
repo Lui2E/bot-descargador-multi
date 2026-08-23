@@ -32,13 +32,22 @@ dp = Dispatcher()
 if not os.path.exists("downloads"):
     os.makedirs("downloads")
 
+# --- DETECCIÓN DE COOKIES EN RENDER ---
+def get_cookie_file():
+    """Detecta la ruta real donde Render monta el archivo secreto."""
+    paths = ["/etc/secrets/cookies.txt", "cookies.txt"]
+    for path in paths:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+    return None
+
 # --- MOTORES DE DESCARGA ---
 
 async def download_instagram_photos_direct(url: str, user_id: int):
-    """Extrae fotos de publicaciones y carruseles de Instagram usando la API Graph pública."""
+    """Extrae imágenes/carruseles de Instagram."""
     shortcode_match = re.search(r'/(?:p|reel)/([A-Za-z0-9_-]+)', url)
     if not shortcode_match:
-        raise Exception("No se encontró shortcode de Instagram.")
+        raise Exception("Sin shortcode válido.")
     
     shortcode = shortcode_match.group(1)
     api_url = f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis"
@@ -46,7 +55,6 @@ async def download_instagram_photos_direct(url: str, user_id: int):
     headers = {
         'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram 324.0.0.0',
         'Accept': '*/*',
-        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
     }
     
     async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=15.0) as client:
@@ -54,45 +62,43 @@ async def download_instagram_photos_direct(url: str, user_id: int):
         if res.status_code == 200:
             data = res.json()
             items = data.get('items', [])
-            if not items:
-                raise Exception("Sin items en respuesta Instagram.")
-            
-            item = items[0]
-            downloaded = []
-            
-            # Caso 1: Carrusel de imágenes
-            if 'carousel_media' in item:
-                for idx, media in enumerate(item['carousel_media']):
-                    candidates = media.get('image_versions2', {}).get('candidates', [])
-                    if candidates:
-                        img_url = candidates[0]['url']
-                        path = f"downloads/{user_id}_{idx}.jpg"
-                        r = await client.get(img_url)
-                        with open(path, 'wb') as f:
-                            f.write(r.content)
-                        downloaded.append(path)
-                if downloaded:
-                    return downloaded
+            if items:
+                item = items[0]
+                downloaded = []
+                
+                # Carrusel
+                if 'carousel_media' in item:
+                    for idx, media in enumerate(item['carousel_media']):
+                        candidates = media.get('image_versions2', {}).get('candidates', [])
+                        if candidates:
+                            img_url = candidates[0]['url']
+                            path = f"downloads/{user_id}_{idx}.jpg"
+                            r = await client.get(img_url)
+                            with open(path, 'wb') as f:
+                                f.write(r.content)
+                            downloaded.append(path)
+                    if downloaded:
+                        return downloaded
 
-            # Caso 2: Imagen individual
-            image_candidates = item.get('image_versions2', {}).get('candidates', [])
-            if image_candidates:
-                img_url = image_candidates[0]['url']
-                path = f"downloads/{user_id}_single.jpg"
-                r = await client.get(img_url)
-                with open(path, 'wb') as f:
-                    f.write(r.content)
-                return [path]
+                # Imagen única
+                candidates = item.get('image_versions2', {}).get('candidates', [])
+                if candidates:
+                    img_url = candidates[0]['url']
+                    path = f"downloads/{user_id}_single.jpg"
+                    r = await client.get(img_url)
+                    with open(path, 'wb') as f:
+                        f.write(r.content)
+                    return [path]
 
-    raise Exception("API directa de Instagram no respondió con imágenes válidas.")
+    raise Exception("API Instagram sin resultados.")
 
 def download_ytdlp_engine(url: str, user_id: int):
-    """Motor robusto de yt-dlp con soporte estricto para sitios de streaming y adultos."""
+    """Motor de descarga universal con soporte de cookies montadas en Render."""
     output_template = f"downloads/{user_id}_%(autonumber)s_%(id)s.%(ext)s"
+    cookie_file = get_cookie_file()
     
     ydl_opts = {
-        # Fuerza descarga del flujo de video real
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'format': 'best/bestvideo+bestaudio',
         'outtmpl': output_template,
         'quiet': True,
         'no_warnings': True,
@@ -102,13 +108,16 @@ def download_ytdlp_engine(url: str, user_id: int):
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
             'Sec-Fetch-Mode': 'navigate',
         }
     }
     
-    if os.path.exists("cookies.txt"):
-        ydl_opts['cookiefile'] = 'cookies.txt'
+    if cookie_file:
+        print(f"✅ Usando archivo de cookies desde: {cookie_file}")
+        ydl_opts['cookiefile'] = cookie_file
+    else:
+        print("⚠️ No se detectó archivo cookies.txt en el sistema.")
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -117,25 +126,25 @@ def download_ytdlp_engine(url: str, user_id: int):
     valid_files = [f for f in downloaded if not f.endswith(('.part', '.ytdl')) and os.path.getsize(f) > 0]
     
     if not valid_files:
-        raise Exception("yt-dlp no completó la descarga.")
+        raise Exception("yt-dlp no generó archivos válidos.")
         
     return valid_files
 
 async def download_media_cascade(url: str, user_id: int):
-    # 1. Si es publicación de Instagram de fotos o post tradicional (/p/)
+    # 1. Instagram Fotos
     if "instagram.com/p/" in url:
         try:
             return await download_instagram_photos_direct(url, user_id)
         except Exception as e:
-            print(f"Instagram Direct API falló: {e}, probando yt-dlp...")
+            print(f"Instagram Direct API falló: {e}")
 
-    # 2. Descarga por yt-dlp estándar
+    # 2. Motor principal yt-dlp (con cookies cargadas)
     try:
         return await asyncio.to_thread(download_ytdlp_engine, url, user_id)
     except Exception as e:
         print(f"yt-dlp falló: {e}")
 
-    # 3. Fallback de imágenes generales
+    # 3. Fallback OpenGraph para fotos de Facebook/Webs
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=10.0) as client:
@@ -178,7 +187,6 @@ async def handle_link(message: types.Message):
     username = f"@{user.username}" if user.username else "Sin username"
     full_name = user.full_name
 
-    # Log seguro al Admin
     if ADMIN_ID != 0:
         log_text = (
             f"📊 LOG DE ACTIVIDAD\n\n"
@@ -199,7 +207,7 @@ async def handle_link(message: types.Message):
         downloaded_files = await download_media_cascade(url, user_id)
 
         if not downloaded_files:
-            raise Exception("No se obtuvieron archivos válidos.")
+            raise Exception("No se obtuvieron archivos.")
 
         for file_path in downloaded_files:
             ext = file_path.lower()
