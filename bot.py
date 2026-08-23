@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import glob
 import yt_dlp
@@ -30,104 +31,101 @@ dp = Dispatcher()
 if not os.path.exists("downloads"):
     os.makedirs("downloads")
 
-# --- MOTOR DE DESCARGA MULTI-MÉTODO ---
+# --- FUNCIONES DE NORMALIZACIÓN Y BYPASS ---
 
-def download_method_1(url, base_template):
-    """Método 1: yt-dlp estándar optimizado."""
-    ydl_opts = {
-        'format': 'bestvideo+bestaudio/best',
-        'outtmpl': base_template,
-        'quiet': True,
-        'no_warnings': True,
-        'nocheckcertificate': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return ydl.prepare_filename(info)
+def clean_url(url: str) -> str:
+    """Limpia parámetros de tracking como ?igsh= o ?si= que provocan errores 403."""
+    url = url.split("?")[0]
+    return url
 
-def download_method_2(url, base_template):
-    """Método 2: yt-dlp con headers móviles de Instagram/Twitter."""
+async def download_twitter_direct(url: str, user_id: int):
+    """Extrae el video directo de Twitter/X usando la API de sindicación VxTwitter."""
+    target_path = f"downloads/{user_id}_twitter.mp4"
+    
+    # Extraer ID del Tweet
+    match = re.search(r'status/(\d+)', url)
+    if not match:
+        raise Exception("No es un enlace de Tweet válido.")
+    
+    tweet_id = match.group(1)
+    api_url = f"https://api.vxtwitter.com/Twitter/status/{tweet_id}"
+    
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.get(api_url)
+        if res.status_code == 200:
+            data = res.json()
+            media_urls = data.get("mediaURLs", [])
+            video_url = data.get("video_url") or (media_urls[0] if media_urls else None)
+            
+            if video_url:
+                async with client.stream("GET", video_url) as r:
+                    with open(target_path, "wb") as f:
+                        async for chunk in r.aiter_bytes():
+                            f.write(chunk)
+                if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+                    return target_path
+
+    raise Exception("No se pudo extraer el video mediante la API de Twitter.")
+
+def download_with_ytdlp(url: str, user_id: int):
+    """Descarga estándar mediante yt-dlp con headers y fallback de cookies."""
+    output_template = f"downloads/{user_id}_%(id)s.%(ext)s"
+    
     ydl_opts = {
-        'format': 'best[ext=mp4]/best',
-        'outtmpl': base_template,
+        'format': 'bestvideo+bestaudio/best[ext=mp4]/best',
+        'outtmpl': output_template,
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
         'age_limit': 0,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram 324.0.0.0',
-            'Accept': '*/*',
-        },
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+        }
     }
+    
+    # Si existe un archivo cookies.txt en el directorio, se usa automáticamente
+    if os.path.exists("cookies.txt"):
+        ydl_opts['cookiefile'] = 'cookies.txt'
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return ydl.prepare_filename(info)
 
-def download_method_cobalt(url, user_id):
-    """Método 3: Bypass mediante API pública externa (Cobalt) para contenido restringido."""
-    target_path = f"downloads/{user_id}_cobalt.mp4"
-    cobalt_instances = [
-        "https://api.cobalt.tools/api/json",
-        "https://cobalt-api.kwiatekm.pl/api/json"
-    ]
+async def download_media_cascade(url: str, user_id: int):
+    """Router inteligente que decide el mejor método según la plataforma."""
+    url_cleaned = clean_url(url)
     
-    for endpoint in cobalt_instances:
+    # 1. Rutas específicas para Twitter / X
+    if "twitter.com" in url.lower() or "x.com" in url.lower():
         try:
-            with httpx.Client(timeout=20.0) as client:
-                res = client.post(
-                    endpoint,
-                    headers={"Accept": "application/json", "Content-Type": "application/json"},
-                    json={"url": url, "vQuality": "720"}
-                )
-                if res.status_code == 200:
-                    data = res.json()
-                    download_url = data.get("url")
-                    if download_url:
-                        # Descargar el stream directo del archivo
-                        with client.stream("GET", download_url) as r:
-                            with open(target_path, "wb") as f:
-                                for chunk in r.iter_bytes(chunk_size=8192):
-                                    f.write(chunk)
-                        if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
-                            return target_path
-        except Exception as err:
-            print(f"Instancia {endpoint} falló: {err}")
-            continue
+            return await download_twitter_direct(url, user_id)
+        except Exception as e:
+            print(f"Bypass Twitter falló: {e}, intentando con extractor general...")
 
-    raise Exception("Bypass externo no pudo extraer el video.")
-
-def download_media_cascade(url, user_id):
-    """Ejecuta los 3 métodos en orden."""
-    output_template = f"downloads/{user_id}_%(id)s.%(ext)s"
-
-    # Intento 1
+    # 2. Descarga estándar / Instagram / TikTok / Sitios de terceros
     try:
-        f = download_method_1(url, output_template)
-        if f and os.path.exists(f): return f
+        f = await asyncio.to_thread(download_with_ytdlp, url_cleaned, user_id)
+        if f and os.path.exists(f):
+            return f
     except Exception as e:
-        print(f"Método 1 falló: {e}")
+        print(f"Descarga yt-dlp limpia falló: {e}, intentando con URL original...")
 
-    # Intento 2
+    # 3. Reintento con URL original completa
     try:
-        f = download_method_2(url, output_template)
-        if f and os.path.exists(f): return f
+        f = await asyncio.to_thread(download_with_ytdlp, url, user_id)
+        if f and os.path.exists(f):
+            return f
     except Exception as e:
-        print(f"Método 2 falló: {e}")
+        print(f"Reintento falló: {e}")
 
-    # Intento 3 (API externa de bypass para restricciones de Instagram/TikTok)
-    try:
-        f = download_method_cobalt(url, user_id)
-        if f and os.path.exists(f): return f
-    except Exception as e:
-        print(f"Método 3 (Cobalt) falló: {e}")
-
-    # Chequeo final de archivos descargados
+    # Chequeo final de archivos generados
     matches = glob.glob(f"downloads/{user_id}_*")
     if matches:
         return matches[0]
 
-    raise Exception("No fue posible descargar el video tras probar todos los métodos.")
+    raise Exception("Todos los métodos de descarga fallaron.")
 
 # --- MANEJADORES ---
 
@@ -152,6 +150,7 @@ async def handle_link(message: types.Message):
     username = f"@{user.username}" if user.username else "Sin username"
     full_name = user.full_name
 
+    # Enviar Log al Admin
     if ADMIN_ID != 0:
         log_text = (
             "📊 **LOG DE ACTIVIDAD**\n\n"
@@ -169,10 +168,10 @@ async def handle_link(message: types.Message):
     file_path = None
 
     try:
-        file_path = await asyncio.to_thread(download_media_cascade, url, user_id)
+        file_path = await download_media_cascade(url, user_id)
 
         if not file_path or not os.path.exists(file_path):
-            raise Exception("Archivo no encontrado tras la descarga.")
+            raise Exception("Archivo no generado.")
 
         ext = file_path.lower()
         if ext.endswith(('.mp4', '.mkv', '.mov', '.webm', '.ts')):
@@ -183,8 +182,8 @@ async def handle_link(message: types.Message):
             await message.reply_document(document=FSInputFile(file_path), caption="✅ **Archivo listo.**")
 
     except Exception as e:
-        print(f"Error procesando {url}: {e}")
-        await message.reply("❌ No se pudo descargar el enlace. Verifica que la publicación sea pública.")
+        print(f"Error final con {url}: {e}")
+        await message.reply("❌ No se pudo descargar el contenido. Verifica que no sea privado.")
     finally:
         for f in glob.glob(f"downloads/{user_id}_*"):
             try:
