@@ -6,7 +6,7 @@ import yt_dlp
 import httpx
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import FSInputFile
+from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo
 from flask import Flask
 from threading import Thread
 
@@ -31,18 +31,10 @@ dp = Dispatcher()
 if not os.path.exists("downloads"):
     os.makedirs("downloads")
 
-# --- FUNCIONES DE NORMALIZACIÓN Y BYPASS ---
-
-def clean_url(url: str) -> str:
-    """Limpia parámetros de tracking como ?igsh= o ?si= que provocan errores 403."""
-    url = url.split("?")[0]
-    return url
+# --- MOTORES DE DESCARGA ---
 
 async def download_twitter_direct(url: str, user_id: int):
-    """Extrae el video directo de Twitter/X usando la API de sindicación VxTwitter."""
-    target_path = f"downloads/{user_id}_twitter.mp4"
-    
-    # Extraer ID del Tweet
+    """Descarga medios directos de Twitter/X."""
     match = re.search(r'status/(\d+)', url)
     if not match:
         raise Exception("No es un enlace de Tweet válido.")
@@ -58,74 +50,64 @@ async def download_twitter_direct(url: str, user_id: int):
             video_url = data.get("video_url") or (media_urls[0] if media_urls else None)
             
             if video_url:
+                ext = "mp4" if ("video" in video_url or ".mp4" in video_url) else "jpg"
+                target_path = f"downloads/{user_id}_tw.{ext}"
                 async with client.stream("GET", video_url) as r:
                     with open(target_path, "wb") as f:
                         async for chunk in r.aiter_bytes():
                             f.write(chunk)
                 if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
-                    return target_path
+                    return [target_path]
+    raise Exception("Fallo en API VxTwitter.")
 
-    raise Exception("No se pudo extraer el video mediante la API de Twitter.")
-
-def download_with_ytdlp(url: str, user_id: int):
-    """Descarga estándar mediante yt-dlp con headers y fallback de cookies."""
-    output_template = f"downloads/{user_id}_%(id)s.%(ext)s"
+def download_universal(url: str, user_id: int):
+    """Descargador universal para videos, fotos, galerías y sitios de adultos."""
+    output_template = f"downloads/{user_id}_%(autonumber)s_%(id)s.%(ext)s"
     
     ydl_opts = {
-        'format': 'bestvideo+bestaudio/best[ext=mp4]/best',
+        # Permite cualquier formato: video, audio, o imagen pura
+        'format': 'bestvideo+bestaudio/best/bestimage',
         'outtmpl': output_template,
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
         'age_limit': 0,
+        'ignoreerrors': True,
+        'writethumbnail': False,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
             'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+            'Sec-Fetch-Mode': 'navigate',
         }
     }
     
-    # Si existe un archivo cookies.txt en el directorio, se usa automáticamente
     if os.path.exists("cookies.txt"):
         ydl_opts['cookiefile'] = 'cookies.txt'
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return ydl.prepare_filename(info)
+        ydl.download([url])
+    
+    # Recolectar todos los archivos generados para este usuario
+    downloaded_files = glob.glob(f"downloads/{user_id}_*")
+    # Filtrar archivos vacíos o temporales
+    valid_files = [f for f in downloaded_files if not f.endswith(('.part', '.ytdl')) and os.path.getsize(f) > 0]
+    
+    if not valid_files:
+        raise Exception("No se generó ningún archivo válido.")
+        
+    return valid_files
 
 async def download_media_cascade(url: str, user_id: int):
-    """Router inteligente que decide el mejor método según la plataforma."""
-    url_cleaned = clean_url(url)
-    
     # 1. Rutas específicas para Twitter / X
     if "twitter.com" in url.lower() or "x.com" in url.lower():
         try:
             return await download_twitter_direct(url, user_id)
         except Exception as e:
-            print(f"Bypass Twitter falló: {e}, intentando con extractor general...")
+            print(f"Bypass Twitter falló: {e}, intentando con universal...")
 
-    # 2. Descarga estándar / Instagram / TikTok / Sitios de terceros
-    try:
-        f = await asyncio.to_thread(download_with_ytdlp, url_cleaned, user_id)
-        if f and os.path.exists(f):
-            return f
-    except Exception as e:
-        print(f"Descarga yt-dlp limpia falló: {e}, intentando con URL original...")
-
-    # 3. Reintento con URL original completa
-    try:
-        f = await asyncio.to_thread(download_with_ytdlp, url, user_id)
-        if f and os.path.exists(f):
-            return f
-    except Exception as e:
-        print(f"Reintento falló: {e}")
-
-    # Chequeo final de archivos generados
-    matches = glob.glob(f"downloads/{user_id}_*")
-    if matches:
-        return matches[0]
-
-    raise Exception("Todos los métodos de descarga fallaron.")
+    # 2. Descarga Universal
+    return await asyncio.to_thread(download_universal, url, user_id)
 
 # --- MANEJADORES ---
 
@@ -139,7 +121,7 @@ async def cmd_start(message: types.Message):
         "✅ Facebook\n"
         "✅ X (Twitter)\n"
         "✅ LinkedIn\n\n"
-        "Solo **envíame el enlace** de la publicación o video."
+        "Solo **envíame el enlace** de la publicación o video que deseas obtener."
     )
 
 @dp.message(F.text.contains("http"))
@@ -150,41 +132,44 @@ async def handle_link(message: types.Message):
     username = f"@{user.username}" if user.username else "Sin username"
     full_name = user.full_name
 
-    # Enviar Log al Admin
+    # Log seguro al Admin sin roturas de Markdown
     if ADMIN_ID != 0:
         log_text = (
-            "📊 **LOG DE ACTIVIDAD**\n\n"
-            f"👤 **Usuario:** {full_name}\n"
-            f"🆔 **ID:** `{user_id}`\n"
-            f"🏷 **Username:** {username}\n"
-            f"🔗 **Enlace:** {url}"
+            f"📊 LOG DE ACTIVIDAD\n\n"
+            f"👤 Usuario: {full_name}\n"
+            f"🆔 ID: {user_id}\n"
+            f"🏷 Username: {username}\n"
+            f"🔗 Enlace: {url}"
         )
         try:
-            await bot.send_message(chat_id=ADMIN_ID, text=log_text, parse_mode="Markdown", disable_web_page_preview=True)
+            await bot.send_message(chat_id=ADMIN_ID, text=log_text, disable_web_page_preview=True)
         except Exception as e:
             print(f"Error log admin: {e}")
 
     status_msg = await message.reply("🔎 **Procesando descarga...**", parse_mode="Markdown")
-    file_path = None
+    downloaded_files = []
 
     try:
-        file_path = await download_media_cascade(url, user_id)
+        downloaded_files = await download_media_cascade(url, user_id)
 
-        if not file_path or not os.path.exists(file_path):
-            raise Exception("Archivo no generado.")
+        if not downloaded_files:
+            raise Exception("No se obtuvieron archivos.")
 
-        ext = file_path.lower()
-        if ext.endswith(('.mp4', '.mkv', '.mov', '.webm', '.ts')):
-            await message.reply_video(video=FSInputFile(file_path), caption="✅ **Video descargado con éxito.**")
-        elif ext.endswith(('.jpg', '.jpeg', '.png', '.webp')):
-            await message.reply_photo(photo=FSInputFile(file_path), caption="✅ **Foto descargada con éxito.**")
-        else:
-            await message.reply_document(document=FSInputFile(file_path), caption="✅ **Archivo listo.**")
+        # Enviar cada archivo descargado según su extensión
+        for file_path in downloaded_files:
+            ext = file_path.lower()
+            if ext.endswith(('.mp4', '.mkv', '.mov', '.webm', '.ts', '.avi')):
+                await message.reply_video(video=FSInputFile(file_path), caption="✅ **Video descargado con éxito.**")
+            elif ext.endswith(('.jpg', '.jpeg', '.png', '.webp', '.heic')):
+                await message.reply_photo(photo=FSInputFile(file_path), caption="✅ **Foto descargada con éxito.**")
+            else:
+                await message.reply_document(document=FSInputFile(file_path), caption="✅ **Archivo listo.**")
 
     except Exception as e:
-        print(f"Error final con {url}: {e}")
-        await message.reply("❌ No se pudo descargar el contenido. Verifica que no sea privado.")
+        print(f"Error final procesando {url}: {e}")
+        await message.reply("❌ No se pudo descargar el enlace. Verifica que la publicación exista y sea pública.")
     finally:
+        # Limpieza completa del disco
         for f in glob.glob(f"downloads/{user_id}_*"):
             try:
                 os.remove(f)
