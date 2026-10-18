@@ -2,6 +2,8 @@ import os
 import re
 import asyncio
 import glob
+import sqlite3
+from datetime import datetime, timedelta
 import yt_dlp
 import httpx
 from aiogram import Bot, Dispatcher, types, F
@@ -31,18 +33,117 @@ dp = Dispatcher()
 if not os.path.exists("downloads"):
     os.makedirs("downloads")
 
-# --- FUNCIONES DE NORMALIZACIÓN Y BYPASS ---
+# --- BASE DE DATOS (LÍMITES, USUARIOS Y BANEOS) ---
+DB_NAME = "/data/bot_database.db" if os.path.exists("/data") else "bot_database.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # Registro de usuarios activos del bot (para broadcasts)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS bot_users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_seen TIMESTAMP
+        )
+    ''')
+    
+    # Registro de descargas
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_downloads (
+            user_id INTEGER,
+            download_time TIMESTAMP
+        )
+    ''')
+    
+    # Usuarios Baneados
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS banned_users (
+            user_id INTEGER PRIMARY KEY,
+            ban_time TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- FUNCIONES AUXILIARES BD ---
+
+def register_user(user_id: int, username: str):
+    """Guarda o actualiza a los usuarios para el envío masivo de mensajes."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO bot_users (user_id, username, first_seen)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET username=excluded.username
+    ''', (user_id, username, datetime.now()))
+    conn.commit()
+    conn.close()
+
+def get_all_users() -> list[int]:
+    """Obtiene la lista de IDs de todos los usuarios registrados."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id FROM bot_users')
+    rows = cursor.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def is_banned(user_id: int) -> bool:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id FROM banned_users WHERE user_id = ?', (user_id,))
+    res = cursor.fetchone()
+    conn.close()
+    return res is not None
+
+def ban_user(user_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR REPLACE INTO banned_users (user_id, ban_time) VALUES (?, ?)',
+                   (user_id, datetime.now()))
+    conn.commit()
+    conn.close()
+
+def unban_user(user_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM banned_users WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def check_and_register_limit(user_id: int, max_downloads: int = 3, hours_window: int = 24) -> tuple[bool, int]:
+    if user_id == ADMIN_ID:
+        return True, 0
+        
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    time_threshold = datetime.now() - timedelta(hours=hours_window)
+    
+    cursor.execute('DELETE FROM user_downloads WHERE download_time < ?', (time_threshold,))
+    cursor.execute('SELECT COUNT(*) FROM user_downloads WHERE user_id = ? AND download_time >= ?', (user_id, time_threshold))
+    count = cursor.fetchone()[0]
+    
+    if count >= max_downloads:
+        conn.commit()
+        conn.close()
+        return False, count
+    
+    cursor.execute('INSERT INTO user_downloads (user_id, download_time) VALUES (?, ?)', (user_id, datetime.now()))
+    conn.commit()
+    conn.close()
+    return True, count + 1
+
+# --- FUNCIONES DE DESCARGA ---
 
 def clean_url(url: str) -> str:
-    """Limpia parámetros de tracking como ?igsh= o ?si= que provocan errores 403."""
-    url = url.split("?")[0]
-    return url
+    return url.split("?")[0]
 
 async def download_twitter_direct(url: str, user_id: int):
-    """Extrae el video directo de Twitter/X usando la API de sindicación VxTwitter."""
     target_path = f"downloads/{user_id}_twitter.mp4"
-    
-    # Extraer ID del Tweet
     match = re.search(r'status/(\d+)', url)
     if not match:
         raise Exception("No es un enlace de Tweet válido.")
@@ -68,8 +169,8 @@ async def download_twitter_direct(url: str, user_id: int):
     raise Exception("No se pudo extraer el video mediante la API de Twitter.")
 
 def download_with_ytdlp(url: str, user_id: int):
-    """Descarga estándar mediante yt-dlp con headers y fallback de cookies."""
     output_template = f"downloads/{user_id}_%(id)s.%(ext)s"
+    cookie_path = "/etc/secrets/cookies.txt" if os.path.exists("/etc/secrets/cookies.txt") else "cookies.txt"
     
     ydl_opts = {
         'format': 'bestvideo+bestaudio/best[ext=mp4]/best',
@@ -85,26 +186,22 @@ def download_with_ytdlp(url: str, user_id: int):
         }
     }
     
-    # Si existe un archivo cookies.txt en el directorio, se usa automáticamente
-    if os.path.exists("cookies.txt"):
-        ydl_opts['cookiefile'] = 'cookies.txt'
+    if os.path.exists(cookie_path):
+        ydl_opts['cookiefile'] = cookie_path
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return ydl.prepare_filename(info)
 
 async def download_media_cascade(url: str, user_id: int):
-    """Router inteligente que decide el mejor método según la plataforma."""
     url_cleaned = clean_url(url)
     
-    # 1. Rutas específicas para Twitter / X
     if "twitter.com" in url.lower() or "x.com" in url.lower():
         try:
             return await download_twitter_direct(url, user_id)
         except Exception as e:
             print(f"Bypass Twitter falló: {e}, intentando con extractor general...")
 
-    # 2. Descarga estándar / Instagram / TikTok / Sitios de terceros
     try:
         f = await asyncio.to_thread(download_with_ytdlp, url_cleaned, user_id)
         if f and os.path.exists(f):
@@ -112,7 +209,6 @@ async def download_media_cascade(url: str, user_id: int):
     except Exception as e:
         print(f"Descarga yt-dlp limpia falló: {e}, intentando con URL original...")
 
-    # 3. Reintento con URL original completa
     try:
         f = await asyncio.to_thread(download_with_ytdlp, url, user_id)
         if f and os.path.exists(f):
@@ -120,7 +216,6 @@ async def download_media_cascade(url: str, user_id: int):
     except Exception as e:
         print(f"Reintento falló: {e}")
 
-    # Chequeo final de archivos generados
     matches = glob.glob(f"downloads/{user_id}_*")
     if matches:
         return matches[0]
@@ -131,6 +226,14 @@ async def download_media_cascade(url: str, user_id: int):
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    username = message.from_user.username or "Sin username"
+    register_user(user_id, username)
+
+    if is_banned(user_id):
+        await message.reply("⛔ **Tu acceso a este bot ha sido bloqueado.**")
+        return
+
     await message.reply(
         "👋 **¡Bienvenido al Descargador Pro!**\n\n"
         "Puedo descargar fotos y videos de:\n"
@@ -139,18 +242,109 @@ async def cmd_start(message: types.Message):
         "✅ Facebook\n"
         "✅ X (Twitter)\n"
         "✅ LinkedIn\n\n"
-        "Solo **envíame el enlace** de la publicación o video."
+        "📌 **Límite diario:** Tienes un máximo de **3 descargas cada 24 horas**.\n\n"
+        "Solo **envíame el enlace** de la publicación o video que deseas obtener."
     )
+
+# --- COMANDOS DE ADMINISTRACIÓN (BAN, UNBAN Y BROADCAST) ---
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+        
+    args = message.text.split()
+    if len(args) < 2:
+        await message.reply("⚠️ Uso correcto: `/ban <ID_USUARIO>`")
+        return
+        
+    try:
+        target_id = int(args[1])
+        ban_user(target_id)
+        await message.reply(f"🚫 El usuario con ID `{target_id}` ha sido **bloqueado**.")
+    except ValueError:
+        await message.reply("❌ ID no válido.")
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+        
+    args = message.text.split()
+    if len(args) < 2:
+        await message.reply("⚠️ Uso correcto: `/unban <ID_USUARIO>`")
+        return
+        
+    try:
+        target_id = int(args[1])
+        unban_user(target_id)
+        await message.reply(f"✅ El usuario con ID `{target_id}` ha sido **desbloqueado**.")
+    except ValueError:
+        await message.reply("❌ ID no válido.")
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message):
+    """Permite al admin enviar un comunicado masivo de ética, concientización, etc."""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    text_to_send = message.text.replace("/broadcast", "").strip()
+    if not text_to_send:
+        await message.reply(
+            "⚠️ **Uso del comando:**\n\n"
+            "`/broadcast <mensaje>`\n\n"
+            "Ejemplo:\n"
+            "`/broadcast 📢 Recordatorio: Por favor, hagamos un uso ético del bot y respetemos los derechos de autor.`"
+        )
+        return
+
+    users = get_all_users()
+    success = 0
+    failed = 0
+
+    status = await message.reply(f"⏳ **Enviando mensaje masivo a {len(users)} usuarios...**")
+
+    for u_id in users:
+        try:
+            await bot.send_message(chat_id=u_id, text=text_to_send, parse_mode="Markdown")
+            success += 1
+            await asyncio.sleep(0.05)  # Pausa breve para prevenir límites de rate de Telegram
+        except Exception:
+            failed += 1
+
+    await status.edit_text(
+        f"✅ **Difusión completada:**\n\n"
+        f"📤 Mensajes enviados: `{success}`\n"
+        f"❌ Fallidos/Bloqueados: `{failed}`"
+    )
+
+# --- MANEJADOR DE ENLACES DE DESCARGA ---
 
 @dp.message(F.text.contains("http"))
 async def handle_link(message: types.Message):
-    url = message.text.strip()
-    user = message.from_user
-    user_id = user.id
-    username = f"@{user.username}" if user.username else "Sin username"
-    full_name = user.full_name
+    user_id = message.from_user.id
+    username = f"@{message.from_user.username}" if message.from_user.username else "Sin username"
+    full_name = message.from_user.full_name
+    
+    register_user(user_id, message.from_user.username or "Sin username")
 
-    # Enviar Log al Admin
+    if is_banned(user_id):
+        await message.reply("⛔ **Tu acceso a este bot ha sido bloqueado.**")
+        return
+
+    url = message.text.strip()
+
+    # Control del límite de 3 descargas por 24 horas
+    can_download, count = check_and_register_limit(user_id, max_downloads=3, hours_window=24)
+    if not can_download:
+        await message.reply(
+            "⚠️ **Límite de descargas alcanzado**\n\n"
+            "Has alcanzado tus **3 descargas permitidas en 24 horas**.\n"
+            "Vuelve a intentarlo mañana cuando se cumpla tu ciclo."
+        )
+        return
+
+    # Log al Admin
     if ADMIN_ID != 0:
         log_text = (
             "📊 **LOG DE ACTIVIDAD**\n\n"
